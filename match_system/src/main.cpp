@@ -6,6 +6,13 @@
 #include <thrift/server/TSimpleServer.h>
 #include <thrift/transport/TServerSocket.h>
 #include <thrift/transport/TBufferTransports.h>
+#include <thrift/TToString.h>
+#include <thrift/concurrency/ThreadManager.h>
+#include <thrift/concurrency/ThreadFactory.h>
+#include <thrift/server/TThreadedServer.h>
+#include <thrift/server/TThreadPoolServer.h>
+#include <thrift/transport/TSocket.h>
+#include <thrift/transport/TTransportUtils.h>
 
 #include <iostream>
 #include <thread>
@@ -34,65 +41,82 @@ struct Queue{
 }task_queue;
 
 class Pool{
-private:
-    vector<User> users;
-public:
-    void save_result(int a,int b){
-        printf("Match result is %d and %d.\n",a,b);
-    }
-
-    void match(){
-        while(users.size()>1){
-            auto a=users[0], b=users[1];
-            save_result(a.id, b.id);
-            users.erase(users.begin());
-            users.erase(users.begin());
+    private:
+        vector<User> users;
+    public:
+        void save_result(int a,int b){
+            printf("Match result is %d and %d.\n",a,b);
         }
-    }
 
-    void add(User user){
-        users.push_back(user);
-    }
-
-    void remove(User user){
-        for(uint32_t i=0; i<users.size(); i++){
-            if(users[i].id == user.id){
-                users.erase(users.begin() + i);
-                break;
+        void match(){
+            while(users.size()>1){
+                auto a=users[0], b=users[1];
+                save_result(a.id, b.id);
+                users.erase(users.begin());
+                users.erase(users.begin());
             }
         }
-    }
+
+        void add(User user){
+            users.push_back(user);
+        }
+
+        void remove(User user){
+            for(uint32_t i=0; i<users.size(); i++){
+                if(users[i].id == user.id){
+                    users.erase(users.begin() + i);
+                    break;
+                }
+            }
+        }
 }pool;
 
 
 class MatchHandler : virtual public MatchIf {
- public:
-  MatchHandler() {
-    // Your initialization goes here
-  }
+    public:
+        MatchHandler() {
+            // Your initialization goes here
+        }
 
-  int32_t add_user(const User& user, const std::string& info) {
-    // Your implementation goes here
-    printf("add_user\n");
+        int32_t add_user(const User& user, const std::string& info) {
+            // Your implementation goes here
+            printf("add_user\n");
 
-    unique_lock<mutex> lock(task_queue.m);
-    task_queue.q.push({user,"add"});
-    task_queue.cv.notify_all();
+            unique_lock<mutex> lock(task_queue.m);
+            task_queue.q.push({user,"add"});
+            task_queue.cv.notify_all();
 
-    return 0;
-  }
+            return 0;
+        }
 
-  int32_t remove_user(const User& user, const std::string& info) {
-    // Your implementation goes here
-    printf("remove_user\n");
+        int32_t remove_user(const User& user, const std::string& info) {
+            // Your implementation goes here
+            printf("remove_user\n");
 
-    unique_lock<mutex> lock(task_queue.m);
-    task_queue.q.push({user,"remove"});
-    task_queue.cv.notify_all();
+            unique_lock<mutex> lock(task_queue.m);
+            task_queue.q.push({user,"remove"});
+            task_queue.cv.notify_all();
 
-    return 0;
-  }
+            return 0;
+        }
+};
 
+class MatchCloneFactory : virtual public MatchIfFactory {
+    public:
+        ~MatchCloneFactory() override = default;
+        MatchIf* getHandler(const ::apache::thrift::TConnectionInfo& connInfo) override
+        {
+            std::shared_ptr<TSocket> sock = std::dynamic_pointer_cast<TSocket>(connInfo.transport);
+            /*cout << "Incoming connection\n";
+            cout << "\tSocketInfo: "  << sock->getSocketInfo() << "\n";
+            cout << "\tPeerHost: "    << sock->getPeerHost() << "\n";
+            cout << "\tPeerAddress: " << sock->getPeerAddress() << "\n";
+            cout << "\tPeerPort: "    << sock->getPeerPort() << "\n";*/
+            return new MatchHandler;
+        }
+        void releaseHandler( MatchIf* handler) override {
+            delete handler;
+        }
 };
 
 void match_task(){
@@ -110,27 +134,24 @@ void match_task(){
                 pool.add(task.user);
             if(task.type == "remove")
                 pool.remove(task.user);
-            
+
             pool.match();
         }
     }
 }
 
 int main(int argc, char **argv) {
-  int port = 9090;
-  ::std::shared_ptr<MatchHandler> handler(new MatchHandler());
-  ::std::shared_ptr<TProcessor> processor(new MatchProcessor(handler));
-  ::std::shared_ptr<TServerTransport> serverTransport(new TServerSocket(port));
-  ::std::shared_ptr<TTransportFactory> transportFactory(new TBufferedTransportFactory());
-  ::std::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
+    TThreadedServer server(
+            std::make_shared<MatchProcessorFactory>(std::make_shared<MatchCloneFactory>()),
+            std::make_shared<TServerSocket>(9090), //port
+            std::make_shared<TBufferedTransportFactory>(),
+            std::make_shared<TBinaryProtocolFactory>());
 
-  TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
+    cout<<"Start Match Server"<<endl;
 
-  cout<<"Start Match Server"<<endl;
+    thread matching_thread(match_task);
 
-  thread matching_thread(match_task);
-
-  server.serve();
-  return 0;
+    server.serve();
+    return 0;
 }
 
