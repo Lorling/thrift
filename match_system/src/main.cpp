@@ -20,6 +20,7 @@
 #include <queue>
 #include <vector>
 #include <condition_variable>
+#include <unistd.h>
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
@@ -43,28 +44,56 @@ struct Queue{
 class Pool{
     private:
         vector<User> users;
+        vector<int> wt;//等待时间
     public:
         void save_result(int a,int b){
             printf("Match result is %d and %d.\n",a,b);
         }
 
+        bool check_match(uint32_t i,uint32_t j){
+            auto a=users[i], b=users[j];
+
+            int dif = abs(a.score - b.score);
+            int a_dif = wt[i] * 50;
+            int b_dif = wt[i] * 50;
+
+            return dif <= a_dif && dif <= b_dif;
+        }
+
         void match(){
+            for(uint32_t i= 0;i<wt.size(); i++)
+                wt[i] ++;//等待时间+1
+
             while(users.size()>1){
-                auto a=users[0], b=users[1];
-                save_result(a.id, b.id);
-                users.erase(users.begin());
-                users.erase(users.begin());
+                bool flag = true;
+                for(uint32_t i=0;i<users.size(); i++){
+                    for(uint32_t j = i + 1; j<users.size(); j++){
+                        if(check_match(i, j)){
+                            save_result(users[i].id, users[j].id);
+                            users.erase(users.begin() + j);
+                            users.erase(users.begin() + i);
+                            wt.erase(wt.begin() + j);
+                            wt.erase(wt.begin() + i);
+                            flag = false;
+                            break;
+                        }
+                    if(!flag) break;//如果匹配上则退出循环
+                    }
+                }
+                if(flag) break;//如果没有匹配上就退出匹配
             }
         }
 
         void add(User user){
             users.push_back(user);
+            wt.push_back(0);
         }
 
         void remove(User user){
             for(uint32_t i=0; i<users.size(); i++){
                 if(users[i].id == user.id){
                     users.erase(users.begin() + i);
+                    wt.erase(wt.begin() + i);
                     break;
                 }
             }
@@ -123,7 +152,9 @@ void match_task(){
     while (true){
         unique_lock<mutex> lock(task_queue.m);
         if(task_queue.q.empty()){
-            task_queue.cv.wait(lock);
+            task_queue.m.unlock();
+            pool.match();
+            sleep(1);//每一秒匹配一次
         }
         else {
             auto task = task_queue.q.front();
@@ -134,8 +165,6 @@ void match_task(){
                 pool.add(task.user);
             if(task.type == "remove")
                 pool.remove(task.user);
-
-            pool.match();
         }
     }
 }
