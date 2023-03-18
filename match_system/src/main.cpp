@@ -7,12 +7,63 @@
 #include <thrift/transport/TServerSocket.h>
 #include <thrift/transport/TBufferTransports.h>
 
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <vector>
+#include <condition_variable>
+
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
 using namespace ::apache::thrift::server;
 
 using namespace  ::match_service;
+using namespace std;
+
+struct Task{
+    User user;
+    string type;//记录add或者remove
+};
+
+struct Queue{
+    queue<Task> q;
+    mutex m;
+    condition_variable cv;
+}task_queue;
+
+class Pool{
+private:
+    vector<User> users;
+public:
+    void save_result(int a,int b){
+        printf("Match result is %d and %d.\n",a,b);
+    }
+
+    void match(){
+        while(users.size()>1){
+            auto a=users[0], b=users[1];
+            save_result(a.id, b.id);
+            users.erase(users.begin());
+            users.erase(users.begin());
+        }
+    }
+
+    void add(User user){
+        users.push_back(user);
+    }
+
+    void remove(User user){
+        for(uint32_t i=0; i<users.size(); i++){
+            if(users[i].id == user.id){
+                users.erase(users.begin() + i);
+                break;
+            }
+        }
+    }
+}pool;
+
 
 class MatchHandler : virtual public MatchIf {
  public:
@@ -24,6 +75,10 @@ class MatchHandler : virtual public MatchIf {
     // Your implementation goes here
     printf("add_user\n");
 
+    unique_lock<mutex> lock(task_queue.m);
+    task_queue.q.push({user,"add"});
+    task_queue.cv.notify_all();
+
     return 0;
   }
 
@@ -31,10 +86,35 @@ class MatchHandler : virtual public MatchIf {
     // Your implementation goes here
     printf("remove_user\n");
 
+    unique_lock<mutex> lock(task_queue.m);
+    task_queue.q.push({user,"remove"});
+    task_queue.cv.notify_all();
+
     return 0;
   }
 
 };
+
+void match_task(){
+    while (true){
+        unique_lock<mutex> lock(task_queue.m);
+        if(task_queue.q.empty()){
+            task_queue.cv.wait(lock);
+        }
+        else {
+            auto task = task_queue.q.front();
+            task_queue.q.pop();
+            task_queue.m.unlock();
+
+            if(task.type == "add")
+                pool.add(task.user);
+            if(task.type == "remove")
+                pool.remove(task.user);
+            
+            pool.match();
+        }
+    }
+}
 
 int main(int argc, char **argv) {
   int port = 9090;
@@ -45,6 +125,11 @@ int main(int argc, char **argv) {
   ::std::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
 
   TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
+
+  cout<<"Start Match Server"<<endl;
+
+  thread matching_thread(match_task);
+
   server.serve();
   return 0;
 }
